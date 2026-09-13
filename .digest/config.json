@@ -1,0 +1,6 @@
+{
+  "wikiRoot": ".digest/",
+  "phaseDirPadding": 2,
+  "catalogTokenBudget": 2000,
+  "modelJudge": false
+}

@@ -13,9 +13,11 @@
 // Env vars needed: X_BEARER_TOKEN, SUPADATA_API_KEY
 // ============================================================================
 
-import { readFile, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
+import { loadState, saveState, hasSeen } from './lib/state-store.js';
+import { publish, reconcile } from './lib/publish.js';
+import { fetchWithRetry, FetchReport } from './lib/fetch-retry.js';
 
 // -- Constants ---------------------------------------------------------------
 
@@ -27,35 +29,15 @@ const MAX_TWEETS_PER_USER = 3;
 
 // State file lives in the repo root so it gets committed by GitHub Actions
 const SCRIPT_DIR = decodeURIComponent(new URL('.', import.meta.url).pathname);
-const STATE_PATH = join(SCRIPT_DIR, '..', 'state-feed.json');
+const REPO_ROOT = join(SCRIPT_DIR, '..');
+const STATE_PATH = join(REPO_ROOT, 'state-feed.json');
 
 // -- State Management --------------------------------------------------------
 
-// Tracks which tweet IDs and video IDs we've already included in feeds
-// so we never send the same content twice across runs.
-
-async function loadState() {
-  if (!existsSync(STATE_PATH)) {
-    return { seenTweets: {}, seenVideos: {} };
-  }
-  try {
-    return JSON.parse(await readFile(STATE_PATH, 'utf-8'));
-  } catch {
-    return { seenTweets: {}, seenVideos: {} };
-  }
-}
-
-async function saveState(state) {
-  // Prune entries older than 7 days to prevent the file from growing forever
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  for (const [id, ts] of Object.entries(state.seenTweets)) {
-    if (ts < cutoff) delete state.seenTweets[id];
-  }
-  for (const [id, ts] of Object.entries(state.seenVideos)) {
-    if (ts < cutoff) delete state.seenVideos[id];
-  }
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
-}
+// Tracks which tweet IDs and video IDs we've already included in feeds so we never
+// send the same content twice across runs. The store (lib/state-store.js) owns
+// atomicity, locking and corruption reporting — this file only decides what to do
+// when the state cannot be read.
 
 // -- Load Sources ------------------------------------------------------------
 
@@ -66,9 +48,10 @@ async function loadSources() {
 
 // -- YouTube Fetching (Supadata API) -----------------------------------------
 
-async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
+async function fetchYouTubeContent(podcasts, apiKey, state, errors, marks) {
   const cutoff = new Date(Date.now() - PODCAST_LOOKBACK_HOURS * 60 * 60 * 1000);
   const allCandidates = [];
+  const report = new FetchReport();
 
   for (const podcast of podcasts) {
     try {
@@ -79,29 +62,27 @@ async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
         videosUrl = `${SUPADATA_BASE}/youtube/channel/videos?id=${podcast.channelHandle}&type=video`;
       }
 
-      const videosRes = await fetch(videosUrl, {
+      const attempt = report.record(podcast.name, await fetchWithRetry(videosUrl, {
         headers: { 'x-api-key': apiKey }
-      });
-
-      if (!videosRes.ok) {
-        errors.push(`YouTube: Failed to fetch videos for ${podcast.name}: HTTP ${videosRes.status}`);
-        continue;
-      }
+      }));
+      // A failing source costs that source, never the run.
+      if (attempt.classification !== 'ok') continue;
+      const videosRes = attempt.response;
 
       const videosData = await videosRes.json();
       const videoIds = videosData.videoIds || videosData.video_ids || [];
 
       // Check first 2 videos per channel, skip already-seen ones
       for (const videoId of videoIds.slice(0, 2)) {
-        if (state.seenVideos[videoId]) continue; // dedup
+        if (hasSeen(state, 'video', videoId)) continue; // dedup
 
         try {
-          const metaRes = await fetch(
+          const metaAttempt = await fetchWithRetry(
             `${SUPADATA_BASE}/youtube/video?id=${videoId}`,
             { headers: { 'x-api-key': apiKey } }
           );
-          if (!metaRes.ok) continue;
-          const meta = await metaRes.json();
+          if (metaAttempt.classification !== 'ok') continue;
+          const meta = await metaAttempt.response.json();
           const publishedAt = meta.uploadDate || meta.publishedAt || meta.date || null;
 
           allCandidates.push({
@@ -133,20 +114,20 @@ async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
   // Fetch transcript
   try {
     const videoUrl = `https://www.youtube.com/watch?v=${selected.videoId}`;
-    const transcriptRes = await fetch(
+    const transcriptAttempt = report.record(`transcript ${selected.videoId}`, await fetchWithRetry(
       `${SUPADATA_BASE}/youtube/transcript?url=${encodeURIComponent(videoUrl)}&text=true`,
       { headers: { 'x-api-key': apiKey } }
-    );
+    ));
 
-    if (!transcriptRes.ok) {
-      errors.push(`YouTube: Failed to get transcript for ${selected.videoId}: HTTP ${transcriptRes.status}`);
+    if (transcriptAttempt.classification !== 'ok') {
+      errors.push(...report.messages('YouTube: '));
       return [];
     }
 
-    const transcriptData = await transcriptRes.json();
+    const transcriptData = await transcriptAttempt.response.json();
 
-    // Mark as seen
-    state.seenVideos[selected.videoId] = Date.now();
+    // Earned only once the feed is published (02:publish)
+    marks.push({ kind: 'video', id: selected.videoId });
 
     return [{
       source: 'podcast',
@@ -160,13 +141,16 @@ async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
   } catch (err) {
     errors.push(`YouTube: Error fetching transcript for ${selected.videoId}: ${err.message}`);
     return [];
+  } finally {
+    errors.push(...report.messages('YouTube: '));
   }
 }
 
 // -- X/Twitter Fetching (Official API v2) ------------------------------------
 
-async function fetchXContent(xAccounts, bearerToken, state, errors) {
+async function fetchXContent(xAccounts, bearerToken, state, errors, marks) {
   const results = [];
+  const report = new FetchReport();
   const cutoff = new Date(Date.now() - TWEET_LOOKBACK_HOURS * 60 * 60 * 1000);
 
   // Batch lookup all user IDs (1 API call)
@@ -176,17 +160,13 @@ async function fetchXContent(xAccounts, bearerToken, state, errors) {
   for (let i = 0; i < handles.length; i += 100) {
     const batch = handles.slice(i, i + 100);
     try {
-      const res = await fetch(
+      const attempt = report.record(`user lookup batch ${i / 100 + 1}`, await fetchWithRetry(
         `${X_API_BASE}/users/by?usernames=${batch.join(',')}&user.fields=name,description`,
         { headers: { 'Authorization': `Bearer ${bearerToken}` } }
-      );
+      ));
+      if (attempt.classification !== 'ok') continue;
 
-      if (!res.ok) {
-        errors.push(`X API: User lookup failed: HTTP ${res.status}`);
-        continue;
-      }
-
-      const data = await res.json();
+      const data = await attempt.response.json();
       for (const user of (data.data || [])) {
         userMap[user.username.toLowerCase()] = {
           id: user.id,
@@ -210,31 +190,26 @@ async function fetchXContent(xAccounts, bearerToken, state, errors) {
     if (!userData) continue;
 
     try {
-      const res = await fetch(
+      const attempt = report.record(`@${account.handle}`, await fetchWithRetry(
         `${X_API_BASE}/users/${userData.id}/tweets?` +
         `max_results=5` +       // fetch 5, then filter to 3 new ones
         `&tweet.fields=created_at,public_metrics,referenced_tweets,note_tweet` +
         `&exclude=retweets,replies` +
         `&start_time=${cutoff.toISOString()}`,
         { headers: { 'Authorization': `Bearer ${bearerToken}` } }
-      );
+      ));
 
-      if (!res.ok) {
-        if (res.status === 429) {
-          errors.push(`X API: Rate limited, skipping remaining accounts`);
-          break;
-        }
-        errors.push(`X API: Failed to fetch tweets for @${account.handle}: HTTP ${res.status}`);
-        continue;
-      }
+      // A rate limit costs this account, not every account after it. The old code broke out
+      // of the loop here, so one 429 silently dropped the rest of the run.
+      if (attempt.classification !== 'ok') continue;
 
-      const data = await res.json();
+      const data = await attempt.response.json();
       const allTweets = data.data || [];
 
       // Filter out already-seen tweets, cap at 3
       const newTweets = [];
       for (const t of allTweets) {
-        if (state.seenTweets[t.id]) continue; // dedup
+        if (hasSeen(state, 'tweet', t.id)) continue; // dedup
         if (newTweets.length >= MAX_TWEETS_PER_USER) break;
 
         newTweets.push({
@@ -250,8 +225,8 @@ async function fetchXContent(xAccounts, bearerToken, state, errors) {
           quotedTweetId: t.referenced_tweets?.find(r => r.type === 'quoted')?.id || null
         });
 
-        // Mark as seen
-        state.seenTweets[t.id] = Date.now();
+        // Earned only once the feed is published (02:publish)
+        marks.push({ kind: 'tweet', id: t.id });
       }
 
       if (newTweets.length === 0) continue;
@@ -270,6 +245,7 @@ async function fetchXContent(xAccounts, bearerToken, state, errors) {
     }
   }
 
+  errors.push(...report.messages('X API: '));
   return results;
 }
 
@@ -293,14 +269,33 @@ async function main() {
   }
 
   const sources = await loadSources();
-  const state = await loadState();
+
+  // A run that cannot read its own dedup memory must not publish. The old code caught the
+  // parse error and carried on with empty state, which re-features everything ever sent.
+  const { state, status, error } = await loadState(STATE_PATH);
+  if (status === 'unreadable') {
+    console.error(`state-feed.json is unreadable, refusing to publish: ${error}`);
+    console.error('Restore it from git history (it is a committed file) and re-run.');
+    process.exit(1);
+  }
+  if (status === 'missing') {
+    console.error('No state-feed.json yet — treating this as a first run.');
+  }
+
+  // Recover from a crash between publishing and committing marks, in either direction.
+  const recovered = await reconcile(state, { feedDir: REPO_ROOT, statePath: STATE_PATH });
+  if (recovered.checked.length) {
+    console.error(`  reconciled ${recovered.checked.join(', ')}: ${recovered.promoted} promoted, ${recovered.dropped} dropped`);
+  }
+
   const errors = [];
 
   // Fetch tweets (unless --podcasts-only)
   let xContent = [];
   if (!podcastsOnly) {
     console.error('Fetching X/Twitter content...');
-    xContent = await fetchXContent(sources.x_accounts, xBearerToken, state, errors);
+    const xMarks = [];
+    xContent = await fetchXContent(sources.x_accounts, xBearerToken, state, errors, xMarks);
     console.error(`  Found ${xContent.length} builders with new tweets`);
 
     const totalTweets = xContent.reduce((sum, a) => sum + a.tweets.length, 0);
@@ -312,15 +307,18 @@ async function main() {
       errors: errors.filter(e => e.startsWith('X API')).length > 0
         ? errors.filter(e => e.startsWith('X API')) : undefined
     };
-    await writeFile(join(SCRIPT_DIR, '..', 'feed-x.json'), JSON.stringify(xFeed, null, 2));
-    console.error(`  feed-x.json: ${xContent.length} builders, ${totalTweets} tweets`);
+    const { promoted } = await publish({
+      feedPath: join(REPO_ROOT, 'feed-x.json'), feed: xFeed, marks: xMarks, statePath: STATE_PATH, state,
+    });
+    console.error(`  feed-x.json: ${xContent.length} builders, ${totalTweets} tweets (${promoted} marked seen)`);
   }
 
   // Fetch podcasts (unless --tweets-only)
   let podcasts = [];
   if (!tweetsOnly) {
     console.error('Fetching YouTube content...');
-    podcasts = await fetchYouTubeContent(sources.podcasts, supadataKey, state, errors);
+    const podMarks = [];
+    podcasts = await fetchYouTubeContent(sources.podcasts, supadataKey, state, errors, podMarks);
     console.error(`  Found ${podcasts.length} new episodes`);
 
     const podcastFeed = {
@@ -331,12 +329,15 @@ async function main() {
       errors: errors.filter(e => e.startsWith('YouTube')).length > 0
         ? errors.filter(e => e.startsWith('YouTube')) : undefined
     };
-    await writeFile(join(SCRIPT_DIR, '..', 'feed-podcasts.json'), JSON.stringify(podcastFeed, null, 2));
-    console.error(`  feed-podcasts.json: ${podcasts.length} episodes`);
+    const { promoted } = await publish({
+      feedPath: join(REPO_ROOT, 'feed-podcasts.json'), feed: podcastFeed, marks: podMarks, statePath: STATE_PATH, state,
+    });
+    console.error(`  feed-podcasts.json: ${podcasts.length} episodes (${promoted} marked seen)`);
   }
 
-  // Save dedup state
-  await saveState(state);
+  // publish() already committed each feed's marks atomically; this save only prunes.
+  const { pruned } = await saveState(STATE_PATH, state);
+  if (pruned > 0) console.error(`  pruned ${pruned} expired state entries`);
 
   if (errors.length > 0) {
     console.error(`  ${errors.length} non-fatal errors`);

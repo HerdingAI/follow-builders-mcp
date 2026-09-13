@@ -2,3 +2,7 @@ scripts/node_modules/
 .env
 *.log
 .DS_Store
+
+# Atomic-write temp files (scripts/lib/state-store.js writes a sibling of its target,
+# so a crashed run can leave one next to state-feed.json in the repo root)
+.*.tmp-*
